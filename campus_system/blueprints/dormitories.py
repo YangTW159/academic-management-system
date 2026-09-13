@@ -1,6 +1,6 @@
 from flask import Blueprint, jsonify
 
-from campus_system.db import db_cursor, fetch_all, fetch_one
+from campus_system.db import db
 from campus_system.extensions import (
     ServiceError,
     current_user,
@@ -9,32 +9,40 @@ from campus_system.extensions import (
     record_log,
     role_required,
 )
+from campus_system.models import DormManager, Dormitory
 
 bp = Blueprint("dormitories", __name__)
 
-_DORM_SELECT = """
-    SELECT
-      d.dorm_id, d.building, d.room, d.max_num, d.cur_num, d.dm_id, d.status,
-      (d.max_num - d.cur_num) AS available_beds,
-      dm.dm_name AS manager_name
-    FROM dormitory d
-    LEFT JOIN dorm_manager dm ON d.dm_id = dm.dm_id
-"""
+
+def _dorm_to_dict(row):
+    return {
+        "dorm_id": row.dorm_id, "building": row.building, "room": row.room,
+        "max_num": row.max_num, "cur_num": row.cur_num, "dm_id": row.dm_id,
+        "status": row.status,
+        "available_beds": row.max_num - row.cur_num,
+        "manager_name": row.dm_name if hasattr(row, "dm_name") else None,
+    }
 
 
 @bp.get("/api/dormitories")
 @login_required
 def dormitory_list():
     user = current_user()
-    params = []
-    where_sql = ""
+    query = db.session.query(
+        Dormitory, DormManager.dm_name
+    ).outerjoin(DormManager, Dormitory.dm_id == DormManager.dm_id)
+
     if user["role"] == "dormManager":
-        where_sql = "WHERE d.dm_id = %s"
-        params.append(user["related_id"])
-    rows = fetch_all(
-        f"{_DORM_SELECT} {where_sql} ORDER BY d.building, d.room", params
-    )
-    return jsonify(rows)
+        query = query.filter(Dormitory.dm_id == user["related_id"])
+
+    rows = query.order_by(Dormitory.building, Dormitory.room).all()
+    result = []
+    for dorm, dm_name in rows:
+        d = dorm.to_dict()
+        d["available_beds"] = dorm.max_num - dorm.cur_num
+        d["manager_name"] = dm_name
+        result.append(d)
+    return jsonify(result)
 
 
 @bp.post("/api/dormitories")
@@ -56,25 +64,21 @@ def add_dormitory():
     if user["role"] == "dormManager" and dm_id != user["related_id"]:
         raise ServiceError("宿管只能维护自己负责的宿舍", 403)
 
-    with db_cursor(commit=True) as (_, cursor):
-        cursor.execute("SELECT dorm_id FROM dormitory WHERE dorm_id = %s", (dorm_id,))
-        if cursor.fetchone():
-            raise ServiceError("宿舍号已存在")
-        cursor.execute("SELECT dm_id FROM dorm_manager WHERE dm_id = %s", (dm_id,))
-        if not cursor.fetchone():
-            raise ServiceError("宿管不存在")
-        cursor.execute(
-            """
-            INSERT INTO dormitory (dorm_id, building, room, max_num, cur_num, dm_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """,
-            (dorm_id, building, room, max_num, cur_num, dm_id,
-             body.get("status") or "正常"),
-        )
-        record_log(cursor, user["display_name"], "新增宿舍", dorm_id)
+    if Dormitory.query.filter_by(dorm_id=dorm_id).first():
+        raise ServiceError("宿舍号已存在")
+    if not DormManager.query.filter_by(dm_id=dm_id).first():
+        raise ServiceError("宿管不存在")
 
-    row = fetch_one(f"{_DORM_SELECT} WHERE d.dorm_id = %s", (dorm_id,))
-    return jsonify({"message": "宿舍已新增", "data": row}), 201
+    dorm = Dormitory(
+        dorm_id=dorm_id, building=building, room=room,
+        max_num=max_num, cur_num=cur_num, dm_id=dm_id,
+        status=body.get("status") or "正常",
+    )
+    db.session.add(dorm)
+    db.session.commit()
+    record_log(user["display_name"], "新增宿舍", dorm_id)
+
+    return jsonify({"message": "宿舍已新增", "data": dorm.to_dict()}), 201
 
 
 @bp.put("/api/dormitories/<dorm_id>")
@@ -83,43 +87,31 @@ def edit_dormitory(dorm_id):
     user = current_user()
     body = get_json_body()
 
-    with db_cursor(commit=True) as (_, cursor):
-        cursor.execute(
-            "SELECT dorm_id, dm_id, max_num, cur_num, building, room, status FROM dormitory WHERE dorm_id = %s",
-            (dorm_id,),
-        )
-        dorm_row = cursor.fetchone()
-        if not dorm_row:
-            raise ServiceError("宿舍不存在", 404)
-        if user["role"] == "dormManager" and dorm_row["dm_id"] != user["related_id"]:
-            raise ServiceError("宿管只能维护自己负责的宿舍", 403)
+    dorm = Dormitory.query.filter_by(dorm_id=dorm_id).first()
+    if not dorm:
+        raise ServiceError("宿舍不存在", 404)
+    if user["role"] == "dormManager" and dorm.dm_id != user["related_id"]:
+        raise ServiceError("宿管只能维护自己负责的宿舍", 403)
 
-        next_dm_id = dorm_row["dm_id"] if user["role"] == "dormManager" else (body.get("dm_id") or dorm_row["dm_id"])
-        next_max_num = int(body.get("max_num") or dorm_row["max_num"])
-        next_cur_num = int(body.get("cur_num") or dorm_row["cur_num"])
-        if next_cur_num > next_max_num:
-            raise ServiceError("已住人数不能大于可住人数")
+    next_dm_id = dorm.dm_id if user["role"] == "dormManager" else (body.get("dm_id") or dorm.dm_id)
+    next_max_num = int(body.get("max_num") or dorm.max_num)
+    next_cur_num = int(body.get("cur_num") or dorm.cur_num)
+    if next_cur_num > next_max_num:
+        raise ServiceError("已住人数不能大于可住人数")
 
-        cursor.execute("SELECT dm_id FROM dorm_manager WHERE dm_id = %s", (next_dm_id,))
-        if not cursor.fetchone():
-            raise ServiceError("宿管不存在")
+    if not DormManager.query.filter_by(dm_id=next_dm_id).first():
+        raise ServiceError("宿管不存在")
 
-        cursor.execute(
-            """
-            UPDATE dormitory SET
-              building = %s, room = %s, max_num = %s, cur_num = %s,
-              dm_id = %s, status = %s
-            WHERE dorm_id = %s
-            """,
-            (
-                body.get("building") or dorm_row["building"],
-                body.get("room") or dorm_row["room"],
-                next_max_num, next_cur_num, next_dm_id,
-                body.get("status") or dorm_row["status"],
-                dorm_id,
-            ),
-        )
-        record_log(cursor, user["display_name"], "更新宿舍", dorm_id)
+    if "building" in body:
+        dorm.building = body["building"]
+    if "room" in body:
+        dorm.room = body["room"]
+    dorm.max_num = next_max_num
+    dorm.cur_num = next_cur_num
+    dorm.dm_id = next_dm_id
+    if "status" in body:
+        dorm.status = body["status"]
 
-    row = fetch_one(f"{_DORM_SELECT} WHERE d.dorm_id = %s", (dorm_id,))
-    return jsonify({"message": "宿舍已更新", "data": row})
+    db.session.commit()
+    record_log(user["display_name"], "更新宿舍", dorm_id)
+    return jsonify({"message": "宿舍已更新", "data": dorm.to_dict()})

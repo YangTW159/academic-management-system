@@ -1,6 +1,7 @@
 from functools import wraps
 
 from flask import jsonify, request, session
+from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from campus_system.config import ROLE_LABELS
 
@@ -15,7 +16,18 @@ class ServiceError(Exception):
 
 
 def current_user():
-    return session.get("user")
+    """优先从 session 取（前端兼容），其次从 JWT 取。"""
+    user = session.get("user")
+    if user:
+        return user
+    try:
+        verify_jwt_in_request(optional=True)
+        identity = get_jwt_identity()
+        if identity:
+            return identity
+    except Exception:
+        pass
+    return None
 
 
 def login_required(view_func):
@@ -57,14 +69,13 @@ def parse_bool(value):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def record_log(cursor, actor, action_name, target_name):
-    cursor.execute(
-        """
-        INSERT INTO operation_log (actor, action_name, target_name)
-        VALUES (%s, %s, %s)
-        """,
-        (actor, action_name, target_name),
-    )
+def record_log(actor, action_name, target_name):
+    """记录操作日志（ORM 版）。"""
+    from campus_system.models import OperationLog
+    log = OperationLog(actor=actor, action_name=action_name, target_name=target_name)
+    from campus_system.db import db
+    db.session.add(log)
+    db.session.commit()
 
 
 __all__ = [

@@ -1,6 +1,6 @@
 from flask import Blueprint, jsonify, request
 
-from campus_system.db import db_cursor, fetch_all, fetch_one
+from campus_system.db import db
 from campus_system.extensions import (
     ServiceError,
     current_user,
@@ -9,7 +9,7 @@ from campus_system.extensions import (
     record_log,
     role_required,
 )
-from campus_system.services import get_student_profile
+from campus_system.models import ClassInfo, Course, Dormitory, SC, Student, Teacher
 
 bp = Blueprint("students", __name__)
 
@@ -18,26 +18,23 @@ bp = Blueprint("students", __name__)
 @bp.get("/api/classes")
 @login_required
 def classes():
-    rows = fetch_all(
-        "SELECT class_id, class_name, major, college FROM class_info ORDER BY class_id"
-    )
-    return jsonify(rows)
+    rows = ClassInfo.query.order_by(ClassInfo.class_id).all()
+    return jsonify([r.to_dict() for r in rows])
 
 
 @bp.get("/api/teachers")
 @login_required
 def teachers():
-    rows = fetch_all("SELECT tno, tname, tgender, tedu, tpro FROM teacher ORDER BY tno")
-    return jsonify(rows)
+    rows = Teacher.query.order_by(Teacher.tno).all()
+    return jsonify([r.to_dict() for r in rows])
 
 
 @bp.get("/api/dorm-managers")
 @login_required
 def dorm_managers():
-    rows = fetch_all(
-        "SELECT dm_id, dm_name, dm_gender, dm_phone FROM dorm_manager ORDER BY dm_id"
-    )
-    return jsonify(rows)
+    from campus_system.models import DormManager
+    rows = DormManager.query.order_by(DormManager.dm_id).all()
+    return jsonify([r.to_dict() for r in rows])
 
 
 # ---------- 学生 CRUD ----------
@@ -46,51 +43,45 @@ def dorm_managers():
 def student_list():
     user = current_user()
     keyword = (request.args.get("keyword") or "").strip()
-    where_clauses = []
-    params = []
+
+    query = db.session.query(
+        Student.sno, Student.sname, Student.sgender,
+        Student.sbirth, Student.sphone, Student.class_id,
+        Student.dorm_id, Student.status,
+        ClassInfo.class_name, ClassInfo.major, ClassInfo.college,
+        Dormitory.building, Dormitory.room,
+    ).outerjoin(ClassInfo, Student.class_id == ClassInfo.class_id
+    ).outerjoin(Dormitory, Student.dorm_id == Dormitory.dorm_id)
 
     if user["role"] == "student":
-        where_clauses.append("s.sno = %s")
-        params.append(user["related_id"])
+        query = query.filter(Student.sno == user["related_id"])
     elif user["role"] == "dormManager":
-        where_clauses.append("d.dm_id = %s")
-        params.append(user["related_id"])
+        query = query.filter(Dormitory.dm_id == user["related_id"])
     elif user["role"] == "teacher":
-        where_clauses.append(
-            """
-            EXISTS (
-              SELECT 1 FROM sc sc1
-              JOIN course c1 ON sc1.cno = c1.cno
-              WHERE sc1.sno = s.sno AND c1.tno = %s
-            )
-            """
+        query = query.filter(
+            db.session.query(SC).join(Course, SC.cno == Course.cno).filter(
+                SC.sno == Student.sno, Course.tno == user["related_id"]
+            ).exists()
         )
-        params.append(user["related_id"])
 
     if keyword:
-        where_clauses.append("(s.sno LIKE %s OR s.sname LIKE %s OR c.class_name LIKE %s)")
-        like_value = f"%{keyword}%"
-        params.extend([like_value, like_value, like_value])
+        like = f"%{keyword}%"
+        query = query.filter(
+            db.or_(Student.sno.like(like), Student.sname.like(like), ClassInfo.class_name.like(like))
+        )
 
-    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-    rows = fetch_all(
-        f"""
-        SELECT
-          s.sno, s.sname, s.sgender,
-          DATE_FORMAT(s.sbirth, '%%Y-%%m-%%d') AS sbirth,
-          s.sphone, s.class_id, s.dorm_id, s.status,
-          c.class_name, c.major, c.college,
-          CASE WHEN d.dorm_id IS NULL THEN '未分配'
-               ELSE CONCAT(d.building, '-', d.room) END AS dorm_summary
-        FROM student s
-        LEFT JOIN class_info c ON s.class_id = c.class_id
-        LEFT JOIN dormitory d ON s.dorm_id = d.dorm_id
-        {where_sql}
-        ORDER BY s.sno
-        """,
-        params,
-    )
-    return jsonify(rows)
+    rows = query.order_by(Student.sno).all()
+    result = []
+    for r in rows:
+        result.append({
+            "sno": r.sno, "sname": r.sname, "sgender": r.sgender,
+            "sbirth": r.sbirth.isoformat() if r.sbirth else None,
+            "sphone": r.sphone, "class_id": r.class_id, "dorm_id": r.dorm_id,
+            "status": r.status, "class_name": r.class_name, "major": r.major,
+            "college": r.college,
+            "dorm_summary": f"{r.building}-{r.room}" if r.building else "未分配",
+        })
+    return jsonify(result)
 
 
 @bp.post("/api/students")
@@ -107,46 +98,36 @@ def add_student():
     if not sno or not sname or not class_id:
         raise ServiceError("学号、姓名、班级不能为空")
 
-    with db_cursor(commit=True) as (_, cursor):
-        cursor.execute("SELECT sno FROM student WHERE sno = %s", (sno,))
-        if cursor.fetchone():
-            raise ServiceError("学号已存在")
-        cursor.execute("SELECT class_id FROM class_info WHERE class_id = %s", (class_id,))
-        if not cursor.fetchone():
-            raise ServiceError("班级不存在")
+    if Student.query.filter_by(sno=sno).first():
+        raise ServiceError("学号已存在")
+    if not ClassInfo.query.filter_by(class_id=class_id).first():
+        raise ServiceError("班级不存在")
 
-        if dorm_id:
-            cursor.execute(
-                "SELECT dorm_id, max_num, cur_num FROM dormitory WHERE dorm_id = %s",
-                (dorm_id,),
-            )
-            dorm_row = cursor.fetchone()
-            if not dorm_row:
-                raise ServiceError("宿舍不存在")
-            if int(dorm_row["cur_num"]) >= int(dorm_row["max_num"]):
-                raise ServiceError("宿舍床位已满，无法分配")
+    dorm = None
+    if dorm_id:
+        dorm = Dormitory.query.filter_by(dorm_id=dorm_id).first()
+        if not dorm:
+            raise ServiceError("宿舍不存在")
+        if dorm.cur_num >= dorm.max_num:
+            raise ServiceError("宿舍床位已满，无法分配")
 
-        cursor.execute(
-            """
-            INSERT INTO student (sno, sname, sgender, sbirth, sphone, class_id, dorm_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                sno, sname,
-                body.get("sgender") or None,
-                body.get("sbirth") or None,
-                body.get("sphone") or None,
-                class_id, dorm_id, status,
-            ),
-        )
-        if dorm_id and status not in {"退学", "毕业"}:
-            cursor.execute(
-                "UPDATE dormitory SET cur_num = cur_num + 1 WHERE dorm_id = %s",
-                (dorm_id,),
-            )
-        record_log(cursor, user["display_name"], "新增学生", sno)
+    student = Student(
+        sno=sno, sname=sname,
+        sgender=body.get("sgender") or None,
+        sbirth=body.get("sbirth") or None,
+        sphone=body.get("sphone") or None,
+        class_id=class_id, dorm_id=dorm_id, status=status,
+    )
+    db.session.add(student)
 
-    return jsonify({"message": "学生信息已新增", "data": get_student_profile(sno)}), 201
+    if dorm and status not in {"退学", "毕业"}:
+        dorm.cur_num += 1
+
+    db.session.commit()
+    record_log(user["display_name"], "新增学生", sno)
+
+    profile = get_student_profile(sno)
+    return jsonify({"message": "学生信息已新增", "data": profile}), 201
 
 
 @bp.put("/api/students/<sno>")
@@ -155,66 +136,52 @@ def edit_student(sno):
     user = current_user()
     body = get_json_body()
 
-    with db_cursor(commit=True) as (_, cursor):
-        cursor.execute(
-            "SELECT sno, dorm_id, status FROM student WHERE sno = %s", (sno,)
-        )
-        student_row = cursor.fetchone()
-        if not student_row:
-            raise ServiceError("学生不存在", 404)
+    student = Student.query.filter_by(sno=sno).first()
+    if not student:
+        raise ServiceError("学生不存在", 404)
 
-        next_dorm_id = (body.get("dorm_id") if "dorm_id" in body else student_row["dorm_id"]) or None
-        next_status = (body.get("status") if "status" in body else student_row["status"]) or student_row["status"]
-        old_dorm_id = student_row["dorm_id"]
+    next_dorm_id = (body.get("dorm_id") if "dorm_id" in body else student.dorm_id) or None
+    next_status = (body.get("status") if "status" in body else student.status) or student.status
+    old_dorm_id = student.dorm_id
 
-        if "class_id" in body:
-            cursor.execute("SELECT class_id FROM class_info WHERE class_id = %s", (body["class_id"],))
-            if not cursor.fetchone():
-                raise ServiceError("班级不存在")
+    if "class_id" in body:
+        if not ClassInfo.query.filter_by(class_id=body["class_id"]).first():
+            raise ServiceError("班级不存在")
 
-        if next_dorm_id and next_dorm_id != old_dorm_id and next_status not in {"退学", "毕业"}:
-            cursor.execute(
-                "SELECT dorm_id, max_num, cur_num FROM dormitory WHERE dorm_id = %s",
-                (next_dorm_id,),
-            )
-            new_dorm_row = cursor.fetchone()
-            if not new_dorm_row:
-                raise ServiceError("目标宿舍不存在")
-            if int(new_dorm_row["cur_num"]) >= int(new_dorm_row["max_num"]):
-                raise ServiceError("目标宿舍已满")
+    if next_dorm_id and next_dorm_id != old_dorm_id and next_status not in {"退学", "毕业"}:
+        new_dorm = Dormitory.query.filter_by(dorm_id=next_dorm_id).first()
+        if not new_dorm:
+            raise ServiceError("目标宿舍不存在")
+        if new_dorm.cur_num >= new_dorm.max_num:
+            raise ServiceError("目标宿舍已满")
 
-        profile = get_student_profile(sno)
-        cursor.execute(
-            """
-            UPDATE student SET
-              sname = %s, sgender = %s, sbirth = %s, sphone = %s,
-              class_id = %s, dorm_id = %s, status = %s
-            WHERE sno = %s
-            """,
-            (
-                body.get("sname") or profile["sname"],
-                body.get("sgender") if "sgender" in body else profile["sgender"],
-                body.get("sbirth") if "sbirth" in body else profile["sbirth"],
-                body.get("sphone") if "sphone" in body else profile["sphone"],
-                body.get("class_id") or profile["class_id"],
-                None if next_status in {"退学", "毕业"} else next_dorm_id,
-                next_status,
-                sno,
-            ),
-        )
+    # 更新学生字段
+    if "sname" in body:
+        student.sname = body["sname"]
+    if "sgender" in body:
+        student.sgender = body["sgender"] or None
+    if "sbirth" in body:
+        student.sbirth = body["sbirth"] or None
+    if "sphone" in body:
+        student.sphone = body["sphone"] or None
+    if "class_id" in body:
+        student.class_id = body["class_id"]
+    student.status = next_status
+    student.dorm_id = None if next_status in {"退学", "毕业"} else next_dorm_id
 
-        final_dorm_id = None if next_status in {"退学", "毕业"} else next_dorm_id
-        if old_dorm_id and old_dorm_id != final_dorm_id:
-            cursor.execute(
-                "UPDATE dormitory SET cur_num = GREATEST(cur_num - 1, 0) WHERE dorm_id = %s",
-                (old_dorm_id,),
-            )
-        if final_dorm_id and final_dorm_id != old_dorm_id and next_status not in {"退学", "毕业"}:
-            cursor.execute(
-                "UPDATE dormitory SET cur_num = cur_num + 1 WHERE dorm_id = %s",
-                (final_dorm_id,),
-            )
-        record_log(cursor, user["display_name"], "更新学生", sno)
+    # 处理宿舍人数变动
+    final_dorm_id = None if next_status in {"退学", "毕业"} else next_dorm_id
+    if old_dorm_id and old_dorm_id != final_dorm_id:
+        old_dorm = Dormitory.query.filter_by(dorm_id=old_dorm_id).first()
+        if old_dorm:
+            old_dorm.cur_num = max(old_dorm.cur_num - 1, 0)
+    if final_dorm_id and final_dorm_id != old_dorm_id and next_status not in {"退学", "毕业"}:
+        new_dorm = Dormitory.query.filter_by(dorm_id=final_dorm_id).first()
+        if new_dorm:
+            new_dorm.cur_num += 1
+
+    db.session.commit()
+    record_log(user["display_name"], "更新学生", sno)
 
     return jsonify({"message": "学生信息已更新", "data": get_student_profile(sno)})
 
@@ -223,17 +190,40 @@ def edit_student(sno):
 @role_required("admin")
 def delete_student(sno):
     user = current_user()
-    with db_cursor(commit=True) as (_, cursor):
-        cursor.execute("SELECT dorm_id FROM student WHERE sno = %s", (sno,))
-        student_row = cursor.fetchone()
-        if not student_row:
-            raise ServiceError("学生不存在", 404)
-        if student_row["dorm_id"]:
-            cursor.execute(
-                "UPDATE dormitory SET cur_num = GREATEST(cur_num - 1, 0) WHERE dorm_id = %s",
-                (student_row["dorm_id"],),
-            )
-        cursor.execute("DELETE FROM sc WHERE sno = %s", (sno,))
-        cursor.execute("DELETE FROM student WHERE sno = %s", (sno,))
-        record_log(cursor, user["display_name"], "删除学生", sno)
+    student = Student.query.filter_by(sno=sno).first()
+    if not student:
+        raise ServiceError("学生不存在", 404)
+
+    if student.dorm_id:
+        dorm = Dormitory.query.filter_by(dorm_id=student.dorm_id).first()
+        if dorm:
+            dorm.cur_num = max(dorm.cur_num - 1, 0)
+
+    SC.query.filter_by(sno=sno).delete()
+    db.session.delete(student)
+    db.session.commit()
+    record_log(user["display_name"], "删除学生", sno)
     return jsonify({"message": "学生信息已删除"})
+
+
+def get_student_profile(sno):
+    """返回学生详情（含班级和宿舍信息）。"""
+    row = db.session.query(
+        Student.sno, Student.sname, Student.sgender, Student.sbirth,
+        Student.sphone, Student.class_id, Student.dorm_id, Student.status,
+        ClassInfo.class_name, ClassInfo.major, ClassInfo.college,
+        Dormitory.building, Dormitory.room,
+    ).outerjoin(ClassInfo, Student.class_id == ClassInfo.class_id
+    ).outerjoin(Dormitory, Student.dorm_id == Dormitory.dorm_id
+    ).filter(Student.sno == sno).first()
+
+    if not row:
+        return None
+    return {
+        "sno": row.sno, "sname": row.sname, "sgender": row.sgender,
+        "sbirth": row.sbirth.isoformat() if row.sbirth else None,
+        "sphone": row.sphone, "class_id": row.class_id, "dorm_id": row.dorm_id,
+        "status": row.status, "class_name": row.class_name, "major": row.major,
+        "college": row.college,
+        "dorm_summary": f"{row.building}-{row.room}" if row.building else "未分配",
+    }

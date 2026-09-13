@@ -1,57 +1,108 @@
-# 校园综合事务管理系统（Flask 工程化版）
+# 校园教务综合管理系统
+
+Flask + SQLAlchemy + JWT + MySQL 的教务管理后台，支持学生/课程/宿舍/公告/选课/日志六大业务模块。
 
 ## 技术栈
-- Python 3.10+ / Flask 3.x
-- MySQL 8（PyMySQL，参数化查询防注入）
-- Flask Blueprint 按业务模块拆分路由
-- Session + 装饰器实现 RBAC（admin / teacher / student / dormManager）
-- 结构化日志、全局异常处理、.env 配置分离
-- pytest 冒烟测试、waitress 生产 WSGI 服务器
 
-## 目录结构
+- **后端**：Flask 3 + Flask-SQLAlchemy（ORM）+ Flask-JWT-Extended（鉴权）
+- **数据库**：MySQL 8.0（10 张业务表）
+- **缓存/异步**：Redis（接口缓存，可选）+ Celery（批量发通知异步任务）
+- **接口文档**：Flasgger（Swagger UI）
+- **测试**：pytest（12 个用例）
+- **部署**：waitress（Windows）/ gunicorn（Linux）+ Nginx
+
+## 项目结构
+
 ```
-.
-├── campus_system/           # 应用包
-│   ├── __init__.py          # create_app 工厂 + 错误处理 + 日志
-│   ├── config.py            # 配置（读 .env）
-│   ├── db.py                # PyMySQL 上下文管理器
-│   ├── extensions.py        # ServiceError / 登录鉴权装饰器
-│   ├── services.py          # 业务查询函数
-│   └── blueprints/          # 按模块拆分的路由
-│       ├── auth.py          # 登录 / 登出 / 当前会话
-│       ├── dashboard.py     # 首页 / 健康检查 / 仪表盘
-│       ├── students.py      # 学生 CRUD + 班级/教师/宿管下拉
-│       ├── courses.py       # 课程 CRUD
-│       ├── dormitories.py   # 宿舍 CRUD
-│       ├── notices.py       # 公告 CRUD
-│       ├── enrollments.py   # 选课与成绩
-│       └── logs.py          # 操作日志
-├── static/  templates/      # 前端
-├── tests/                   # pytest 冒烟测试
-├── wsgi.py                  # 启动入口
-├── requirements.txt
-└── .env.example
+campus_system/
+├── __init__.py          # 应用工厂 + 错误处理 + Swagger/Redis/JWT 初始化
+├── config.py            # 配置（从 .env 读取）
+├── db.py                # SQLAlchemy 实例
+├── models.py            # ORM 模型（10 张表）
+├── cache.py             # Redis 缓存层（可选，未连接自动降级）
+├── tasks.py             # Celery 异步任务（批量发通知）
+├── extensions.py        # 鉴权装饰器 + 业务异常
+├── services.py          # 业务逻辑层
+└── blueprints/          # 8 个蓝图模块
+    ├── auth.py          # 登录/登出（返回 JWT token）
+    ├── dashboard.py     # 首页 + health
+    ├── students.py      # 学生 CRUD
+    ├── courses.py       # 课程 CRUD
+    ├── dormitories.py   # 宿舍管理
+    ├── notices.py       # 公告管理
+    ├── enrollments.py   # 选课/成绩
+    └── logs.py          # 操作日志
 ```
 
 ## 快速开始
-```bash
-pip install -r requirements.txt
-cp .env.example .env          # Windows: copy .env.example .env
-# 编辑 .env 填入 MySQL 账号密码
-python wsgi.py
-# 浏览器打开 http://127.0.0.1:5000
-```
 
-## 生产启动（waitress）
 ```bash
-waitress-serve --host=0.0.0.0 --port=5000 wsgi:app
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 配置 .env（参考 .env.example）
+cp .env.example .env
+# 修改数据库密码、JWT_SECRET_KEY
+
+# 3. 初始化数据库（确保 MySQL 已建 edu 库，表结构见 SQL 脚本）
+
+# 4. 运行
+python wsgi.py
+
+# 5. 访问
+# 前端:    http://127.0.0.1:5000
+# Swagger: http://127.0.0.1:5000/apidocs/
 ```
 
 ## 测试
+
 ```bash
 pytest -q
+# 12 passed
 ```
 
-## 与旧版 app.py 的关系
-- `app_legacy.py` 是原始单文件版本，保留备查。
-- 新版通过蓝图拆分，行为与旧版完全一致；如遇问题可直接 `python app_legacy.py` 切回。
+## API 概览
+
+| 模块 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 认证 | POST | /api/login | 登录，返回 JWT token |
+| 认证 | POST | /api/logout | 登出 |
+| 学生 | GET/POST/PUT/DELETE | /api/students | 学生 CRUD |
+| 课程 | GET/POST/PUT/DELETE | /api/courses | 课程 CRUD |
+| 宿舍 | GET/POST/PUT | /api/dormitories | 宿舍管理 |
+| 公告 | GET/POST/PUT/DELETE | /api/notices | 公告管理 |
+| 选课 | GET/POST/PUT/DELETE | /api/enrollments | 选课/成绩 |
+| 仪表板 | GET | /api/dashboard | 统计数据 |
+| 日志 | GET | /api/logs | 操作日志（admin） |
+
+## 生产部署（Linux + Nginx + Gunicorn）
+
+```bash
+# 1. 安装 Redis
+sudo apt install redis-server
+
+# 2. 用 gunicorn 跑（替代 waitress）
+pip install gunicorn
+gunicorn -w 4 -b 127.0.0.1:5000 "campus_system:create_app()"
+
+# 3. Nginx 反代
+server {
+    listen 80;
+    server_name your-domain.com;
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+    }
+}
+
+# 4. 启动 Celery worker（异步任务）
+celery -A campus_system.tasks worker --loglevel=info
+```
+
+## 默认账号
+
+| 角色 | 用户名 | 密码 |
+|------|--------|------|
+| 管理员 | admin | 123456 |
+| 教师 | t001 | 123456 |
+| 学生 | s2024001 | 123456 |
+| 宿管 | dm01 | 123456 |

@@ -36,6 +36,24 @@ DB_CONFIG = {
     "autocommit": False,
 }
 
+# SQLAlchemy 连接串
+SQLALCHEMY_DATABASE_URI = (
+    "mysql+pymysql://{user}:{password}@{host}:{port}/{database}?charset={charset}".format(
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        host=DB_CONFIG["host"],
+        port=DB_CONFIG["port"],
+        database=DB_CONFIG["database"],
+        charset=DB_CONFIG["charset"],
+    )
+)
+
+# JWT 配置
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", APP_CONFIG["SECRET_KEY"])
+
+# Redis 配置（可选，不配置则降级不用缓存）
+REDIS_URL = os.getenv("REDIS_URL", "")
+
 ROLE_LABELS = {
     "admin": "管理员",
     "teacher": "教师",

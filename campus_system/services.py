@@ -1,4 +1,7 @@
-from campus_system.db import fetch_all, fetch_one
+from campus_system.db import db
+from campus_system.models import (
+    ClassInfo, Course, Dormitory, Notice, OperationLog, SC, Student, Teacher,
+)
 
 
 def build_shortcuts(role):
@@ -11,81 +14,55 @@ def build_shortcuts(role):
     return ["维护宿舍信息", "查看床位情况", "发布宿舍通知"]
 
 
-def get_student_profile(sno):
-    return fetch_one(
-        """
-        SELECT
-          s.sno, s.sname, s.sgender,
-          DATE_FORMAT(s.sbirth, '%%Y-%%m-%%d') AS sbirth,
-          s.sphone, s.class_id, s.dorm_id, s.status,
-          c.class_name, c.major, c.college,
-          CASE WHEN d.dorm_id IS NULL THEN '未分配'
-               ELSE CONCAT(d.building, '-', d.room) END AS dorm_summary
-        FROM student s
-        LEFT JOIN class_info c ON s.class_id = c.class_id
-        LEFT JOIN dormitory d ON s.dorm_id = d.dorm_id
-        WHERE s.sno = %s
-        """,
-        (sno,),
-    )
-
-
 def get_course_profile(cno):
-    return fetch_one(
-        """
-        SELECT
-          c.cno, c.cname, c.cperiod, c.credit, c.tno,
-          c.schedule_info, c.classroom, c.weeks, c.status,
-          t.tname AS teacher_name,
-          COUNT(sc.sno) AS selected_count
-        FROM course c
-        LEFT JOIN teacher t ON c.tno = t.tno
-        LEFT JOIN sc ON c.cno = sc.cno
-        WHERE c.cno = %s
-        GROUP BY c.cno, c.cname, c.cperiod, c.credit, c.tno,
-                 c.schedule_info, c.classroom, c.weeks, c.status, t.tname
-        """,
-        (cno,),
-    )
+    row = db.session.query(
+        Course.cno, Course.cname, Course.cperiod, Course.credit, Course.tno,
+        Course.schedule_info, Course.classroom, Course.weeks, Course.status,
+        Teacher.tname.label("teacher_name"),
+        db.func.count(SC.sno).label("selected_count"),
+    ).outerjoin(Teacher, Course.tno == Teacher.tno
+    ).outerjoin(SC, Course.cno == SC.cno
+    ).filter(Course.cno == cno
+    ).group_by(
+        Course.cno, Course.cname, Course.cperiod, Course.credit, Course.tno,
+        Course.schedule_info, Course.classroom, Course.weeks, Course.status, Teacher.tname
+    ).first()
+    if not row:
+        return None
+    return {
+        "cno": row.cno, "cname": row.cname, "cperiod": row.cperiod,
+        "credit": float(row.credit) if row.credit else 0,
+        "tno": row.tno, "schedule_info": row.schedule_info,
+        "classroom": row.classroom, "weeks": row.weeks, "status": row.status,
+        "teacher_name": row.teacher_name, "selected_count": row.selected_count or 0,
+    }
 
 
 def get_visible_notices(user, keyword=""):
-    rows = fetch_all(
-        """
-        SELECT nid, title, content,
-               DATE_FORMAT(publish_time, '%%Y-%%m-%%d %%H:%%i:%%s') AS publish_time,
-               publisher, publisher_role, scope, category, pinned, status
-        FROM notice
-        ORDER BY pinned DESC, publish_time DESC
-        """
-    )
-    keyword = (keyword or "").strip()
+    query = Notice.query.order_by(Notice.pinned.desc(), Notice.publish_time.desc())
+    rows = query.all()
 
-    student_row = None
-    class_name = ""
+    student_class_name = ""
     if user["role"] == "student":
-        student_row = fetch_one(
-            "SELECT c.class_name FROM student s LEFT JOIN class_info c ON s.class_id = c.class_id WHERE s.sno = %s",
-            (user["related_id"],),
-        )
-        class_name = student_row["class_name"] if student_row else ""
+        student = Student.query.filter_by(sno=user["related_id"]).first()
+        if student:
+            cls = ClassInfo.query.filter_by(class_id=student.class_id).first()
+            student_class_name = cls.class_name if cls else ""
 
     buildings = []
     if user["role"] == "dormManager":
-        building_rows = fetch_all(
-            "SELECT building FROM dormitory WHERE dm_id = %s", (user["related_id"],)
-        )
-        buildings = [f"{row['building']}栋" for row in building_rows]
+        buildings = [d.building + "栋" for d in Dormitory.query.filter_by(dm_id=user["related_id"]).all()]
 
-    visible_rows = []
+    keyword = (keyword or "").strip()
+    visible = []
     for row in rows:
-        scope = row["scope"] or ""
+        scope = row.scope or ""
         if user["role"] == "admin":
             allowed = True
         elif user["role"] == "student":
-            allowed = scope in {"全校", "全员", "在读学生", class_name}
+            allowed = scope in {"全校", "全员", "在读学生", student_class_name}
         elif user["role"] == "teacher":
-            allowed = scope in {"全校", "全员", "教师"} or row["publisher_role"] == "teacher"
+            allowed = scope in {"全校", "全员", "教师"} or row.publisher_role == "teacher"
         elif user["role"] == "dormManager":
             allowed = scope in {"全校", "全员", "宿管"} or scope in buildings
         else:
@@ -93,73 +70,68 @@ def get_visible_notices(user, keyword=""):
 
         if not allowed:
             continue
-        if keyword and keyword not in row["title"] and keyword not in row["content"]:
+        if keyword and keyword not in row.title and keyword not in row.content:
             continue
-        visible_rows.append(row)
-    return visible_rows
+        visible.append(row.to_dict())
+    return visible
 
 
 def get_dashboard_payload(user):
-    summary = fetch_one(
-        """
-        SELECT
-          (SELECT COUNT(*) FROM student) AS total_students,
-          (SELECT COUNT(*) FROM student WHERE status = '在读') AS active_students,
-          (SELECT COUNT(*) FROM course) AS total_courses,
-          (SELECT COUNT(*) FROM course WHERE status = '开课中') AS open_courses,
-          (SELECT COUNT(*) FROM dormitory) AS total_dorms,
-          (SELECT ROUND(IFNULL(SUM(cur_num) / NULLIF(SUM(max_num), 0) * 100, 0), 1)
-           FROM dormitory) AS bed_usage_rate,
-          (SELECT COUNT(*) FROM notice) AS total_notices
-        """
-    )
+    total_students = Student.query.count()
+    active_students = Student.query.filter_by(status="在读").count()
+    total_courses = Course.query.count()
+    open_courses = Course.query.filter_by(status="开课中").count()
+    total_dorms = Dormitory.query.count()
+    total_max = db.session.query(db.func.sum(Dormitory.max_num)).scalar() or 0
+    total_cur = db.session.query(db.func.sum(Dormitory.cur_num)).scalar() or 0
+    bed_usage_rate = round(total_cur / total_max * 100, 1) if total_max else 0
+    total_notices = Notice.query.count()
 
-    class_distribution = fetch_all(
-        """
-        SELECT c.class_name AS label, COUNT(s.sno) AS value
-        FROM class_info c LEFT JOIN student s ON c.class_id = s.class_id
-        GROUP BY c.class_id, c.class_name ORDER BY c.class_id
-        """
-    )
-    course_scores = fetch_all(
-        """
-        SELECT c.cname AS label, ROUND(IFNULL(AVG(sc.score), 0), 1) AS value
-        FROM course c LEFT JOIN sc ON c.cno = sc.cno
-        GROUP BY c.cno, c.cname ORDER BY c.cno
-        """
-    )
-    notice_stats = fetch_all(
-        """
-        SELECT category AS label, COUNT(*) AS value FROM notice
-        GROUP BY category ORDER BY COUNT(*) DESC, category
-        """
-    )
+    summary = {
+        "total_students": total_students,
+        "active_students": active_students,
+        "total_courses": total_courses,
+        "open_courses": open_courses,
+        "total_dorms": total_dorms,
+        "bed_usage_rate": bed_usage_rate,
+        "total_notices": total_notices,
+    }
+
+    class_rows = db.session.query(
+        ClassInfo.class_name.label("label"),
+        db.func.count(Student.sno).label("value"),
+    ).outerjoin(Student, ClassInfo.class_id == Student.class_id
+    ).group_by(ClassInfo.class_id, ClassInfo.class_name
+    ).order_by(ClassInfo.class_id).all()
+
+    course_score_rows = db.session.query(
+        Course.cname.label("label"),
+        db.func.round(db.func.avg(SC.score), 1).label("value"),
+    ).outerjoin(SC, Course.cno == SC.cno
+    ).group_by(Course.cno, Course.cname).order_by(Course.cno).all()
+
+    notice_rows = db.session.query(
+        Notice.category.label("label"),
+        db.func.count(Notice.nid).label("value"),
+    ).group_by(Notice.category).order_by(db.func.count(Notice.nid).desc(), Notice.category).all()
 
     latest_notices = get_visible_notices(user)[:5]
-    recent_logs = fetch_all(
-        """
-        SELECT log_id, actor, action_name, target_name,
-               DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS created_at
-        FROM operation_log ORDER BY log_id DESC LIMIT 8
-        """
-    ) if user["role"] == "admin" else fetch_all(
-        """
-        SELECT log_id, actor, action_name, target_name,
-               DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS created_at
-        FROM operation_log WHERE actor = %s
-        ORDER BY log_id DESC LIMIT 8
-        """,
-        (user["display_name"],),
-    )
+
+    if user["role"] == "admin":
+        recent_logs = OperationLog.query.order_by(OperationLog.log_id.desc()).limit(8).all()
+    else:
+        recent_logs = OperationLog.query.filter_by(actor=user["display_name"]).order_by(
+            OperationLog.log_id.desc()
+        ).limit(8).all()
 
     return {
         "summary": summary,
         "charts": {
-            "class_distribution": class_distribution,
-            "course_scores": course_scores,
-            "notice_stats": notice_stats,
+            "class_distribution": [{"label": r.label, "value": r.value} for r in class_rows],
+            "course_scores": [{"label": r.label, "value": float(r.value or 0)} for r in course_score_rows],
+            "notice_stats": [{"label": r.label, "value": r.value} for r in notice_rows],
         },
         "latest_notices": latest_notices,
-        "recent_logs": recent_logs,
+        "recent_logs": [r.to_dict() for r in recent_logs],
         "shortcuts": build_shortcuts(user["role"]),
     }
