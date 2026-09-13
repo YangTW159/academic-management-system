@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="shell">
+    <aside class="sidebar">
+      <div class="brand-card">
+        <p class="eyebrow">Campus Data Platform</p>
+        <h1>{{ app_name }}</h1>
+        <p class="brand-copy">围绕学生、课程、宿舍、公告与选课成绩打造的一体化校园综合事务管理平台。</p>
+      </div>
+
+      <section class="panel status-panel">
+        <div class="panel-head">
+          <h2>系统状态</h2>
+          <span id="health-badge" class="badge badge-muted">检测中</span>
+        </div>
+        <div class="status-list">
+          <div>
+            <span>数据库连接</span>
+            <strong id="health-text">检查中...</strong>
+          </div>
+          <div>
+            <span>数据库版本</span>
+            <strong id="health-version">待获取</strong>
+          </div>
+          <div>
+            <span>当前会话</span>
+            <strong id="session-text">未登录</strong>
+          </div>
+        </div>
+      </section>
+
+      <section id="auth-card" class="panel auth-panel">
+        <div class="panel-head">
+          <h2>账号登录</h2>
+          <span class="badge badge-outline">可直接体验</span>
+        </div>
+        <form id="login-form" class="form-stack">
+          <label>
+            用户名
+            <input id="username" name="username" placeholder="例如：admin" autocomplete="username" required>
+          </label>
+          <label>
+            密码
+            <input id="password" name="password" type="password" placeholder="请输入密码" autocomplete="current-password" required>
+          </label>
+          <button id="login-submit" type="submit" class="primary-btn">登录系统</button>
+        </form>
+        <p id="login-message" class="message"></p>
+        <div class="sample-block">
+          <p>示例账号</p>
+          <div id="sample-accounts" class="sample-grid"></div>
+        </div>
+      </section>
+
+      <section id="session-card" class="panel session-panel hidden">
+        <div class="panel-head">
+          <h2>当前用户</h2>
+          <span id="role-chip" class="badge badge-accent">未登录</span>
+        </div>
+        <div class="identity">
+          <strong id="user-display-name">访客</strong>
+          <span id="user-meta">请先登录</span>
+        </div>
+        <div class="shortcut-block">
+          <p>快捷能力</p>
+          <ul id="shortcut-list" class="shortcut-list"></ul>
+        </div>
+        <button id="logout-btn" class="ghost-btn" type="button">退出登录</button>
+      </section>
+
+      <nav class="panel nav-panel">
+        <div class="panel-head">
+          <h2>功能导航</h2>
+        </div>
+        <div id="nav-menu" class="nav-menu"></div>
+      </nav>
+    </aside>
+
+    <section class="main-panel">
+      <header class="topbar">
+        <div>
+          <p id="view-kicker" class="eyebrow">Overview</p>
+          <h2 id="view-title">首页总览</h2>
+          <p id="view-description" class="topbar-copy">登录后可查看校园事务总览、业务统计与角色化功能入口。</p>
+        </div>
+        <div class="topbar-actions">
+          <button id="refresh-view" class="ghost-btn" type="button">刷新当前页面</button>
+        </div>
+      </header>
+
+      <section id="dashboard-view" class="view-section">
+        <div id="dashboard-hero" class="hero-panel"></div>
+        <div id="summary-grid" class="summary-grid"></div>
+        <div id="chart-grid" class="chart-grid"></div>
+        <div class="split-grid">
+          <article class="panel content-panel">
+            <div class="panel-head">
+              <h3>最新公告</h3>
+              <span class="badge badge-outline">实时可见范围</span>
+            </div>
+            <div id="latest-notices" class="stack-list"></div>
+          </article>
+          <article class="panel content-panel">
+            <div class="panel-head">
+              <h3>最近日志</h3>
+              <span id="log-badge" class="badge badge-outline">登录后展示</span>
+            </div>
+            <div id="recent-logs" class="stack-list"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="workspace-view" class="view-section hidden">
+        <div class="toolbar">
+          <form id="search-form" class="search-form">
+            <input id="search-input" type="search" placeholder="输入关键字后回车查询">
+            <button type="submit" class="primary-btn">查询</button>
+            <button id="reset-search" type="button" class="ghost-btn">清空</button>
+          </form>
+          <div id="workspace-actions" class="workspace-actions"></div>
+        </div>
+
+        <div id="workspace-stats" class="module-stats"></div>
+
+        <div class="workspace-grid">
+          <article class="panel content-panel">
+            <div class="panel-head">
+              <h3 id="table-title">数据列表</h3>
+              <span id="table-badge" class="badge badge-outline">0 条记录</span>
+            </div>
+            <div id="table-wrap" class="table-wrap"></div>
+          </article>
+          <aside class="panel side-panel">
+            <div class="panel-head">
+              <h3>页面说明</h3>
+              <span class="badge badge-muted">角色化展示</span>
+            </div>
+            <div id="insight-panel" class="insight-panel"></div>
+          </aside>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <section class="modal-card">
+      <div class="panel-head">
+        <h3 id="modal-title">编辑数据</h3>
+        <button id="modal-close" class="icon-btn" type="button" aria-label="关闭">×</button>
+      </div>
+      <form id="modal-form" class="form-grid"></form>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="ghost-btn" type="button">取消</button>
+        <button id="modal-submit" class="primary-btn" type="button">保存</button>
+      </div>
+      <p id="modal-message" class="message"></p>
+    </section>
+  </div>
+
+  <div id="toast-root" class="toast-root"></div>
+
+  <script>
+    window.APP_META = {{ {"appName": app_name}|tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
